@@ -1,0 +1,428 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED Display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// PCA9685 Servo Driver
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// Servo definitions
+#define LEFT_ARM_SERVO 0
+#define RIGHT_ARM_SERVO 1
+#define HEAD_SERVO 2
+#define BUZZER_PIN 8
+
+// NEW: Voice recognition pins
+#define MIC_PIN A0        
+#define BUTTON_PIN 2      
+
+// Servo pulse lengths for -90 to +90 degrees
+#define SERVOMIN 150  // Min pulse length count (out of 4096)
+#define SERVOMAX 600  // Max pulse length count (out of 4096)
+
+// Timing variables
+unsigned long lastSoundTime = 0;
+unsigned long lastEyeChange = 0;
+unsigned long lastServoMove[3] = {0, 0, 0};
+unsigned long servoDelay[3];
+
+// NEW: Voice detection variables
+int soundThreshold = 100;     
+bool listeningMode = false;
+unsigned long listenStartTime = 0;
+const int listenDuration = 3000; 
+
+// NEW: Sound pattern storage
+int soundPattern[50];         
+int patternIndex = 0;
+const int patternLength = 50;
+
+// NEW: Robot states
+enum RobotState {
+  IDLE_MODE,
+  LISTENING_MODE,
+  PERFORMING_ACTION
+};
+
+RobotState robotState = IDLE_MODE;
+unsigned long actionStartTime = 0;
+bool actionInProgress = false;
+
+// Eye expressions
+enum EyeExpression {
+  NORMAL,
+  HAPPY,
+  ANGRY,
+  SLEEPY,
+  SURPRISED,
+  WINK,
+  SQUINT,
+  LOVE,
+  CONFUSED
+};
+
+EyeExpression currentExpression = NORMAL;
+int expressionCount = 9;
+
+// --- Servo state tracking ---
+struct ServoState {
+  int currentAngle;   // current actual angle
+  int targetAngle;    // where it wants to go
+  int stepSize;       // how many degrees per update
+  unsigned long lastUpdate;
+  unsigned long moveDelay;  // ms between steps
+};
+
+ServoState servoStates[3];
+
+// --- Init servo states ---
+void initServoStates() {
+  servoStates[LEFT_ARM_SERVO]  = { 90, 90, 1, millis(), 20 };
+  servoStates[RIGHT_ARM_SERVO] = { 45, 45, 1, millis(), 20 };
+  servoStates[HEAD_SERVO]      = { 45, 45, 1, millis(), 20 };
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+
+  // Initialize PCA9685
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50);  // Analog servos run at ~50 Hz
+
+  // Initialize buzzer pin
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // NEW: Initialize voice recognition pins
+  pinMode(MIC_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Set random delays for each servo
+  randomSeed(analogRead(A1));  // Changed from A0 since that's now microphone
+  for (int i = 0; i < 3; i++) {
+    servoDelay[i] = random(1000, 3000);
+  }
+
+  initServoStates();
+
+  // Clear display and show startup
+  display.clearDisplay();
+  drawEyes(NORMAL);
+  display.display();
+
+  // Center all servos
+  moveServo(LEFT_ARM_SERVO, 90);
+  moveServo(RIGHT_ARM_SERVO, 45);
+  moveServo(HEAD_SERVO, 45);
+
+  // Startup sound
+  playWallESound("hello");
+
+  Serial.println("WALL-E Robot Initialized!");
+  Serial.println("Voice commands ready! Press button to activate.");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // NEW: Check for voice input first
+  checkVoiceInput();
+
+  // Only do random behavior when in idle mode
+  if (robotState == IDLE_MODE) {
+    // Play WALL-E sounds every 3-5 seconds
+    if (currentTime - lastSoundTime > random(3000, 5000)) {
+      playRandomWallESound();
+      lastSoundTime = currentTime;
+    }
+
+    // Smooth servo movement
+    updateServos(currentTime);
+
+    // Change eye expression every 2-4 seconds
+    if (currentTime - lastEyeChange > random(2000, 4000)) {
+      changeEyeExpression();
+      lastEyeChange = currentTime;
+    }
+  }
+
+  delay(20);
+}
+
+// NEW: Voice recognition functions
+void checkVoiceInput() {
+  // Check if button is pressed to start listening
+  if (digitalRead(BUTTON_PIN) == LOW && robotState == IDLE_MODE) {
+    startListening();
+  }
+  
+  // If in listening mode, capture sound pattern
+  if (robotState == LISTENING_MODE) {
+    captureSoundPattern();
+    
+    // Check if listening time is up
+    if (millis() - listenStartTime > listenDuration) {
+      stopListening();
+      processVoiceCommand();
+    }
+  }
+  
+  // Check if action is complete
+  if (actionInProgress && millis() - actionStartTime > 3000) {
+    actionInProgress = false;
+    robotState = IDLE_MODE;
+    drawEyes(NORMAL);
+    display.display();
+  }
+}
+
+void startListening() {
+  Serial.println("Listening for command...");
+  robotState = LISTENING_MODE;
+  listeningMode = true;
+  listenStartTime = millis();
+  patternIndex = 0;
+  
+  // Show listening eyes
+  drawEyes(SURPRISED);
+  display.display();
+  
+  // Clear the pattern array
+  for (int i = 0; i < patternLength; i++) {
+    soundPattern[i] = 0;
+  }
+  
+  // Play listening sound
+  tone(BUZZER_PIN, 800, 100);
+}
+
+void captureSoundPattern() {
+  if (patternIndex < patternLength) {
+    int soundLevel = analogRead(MIC_PIN);
+    
+    // Only record significant sound levels
+    if (soundLevel > soundThreshold) {
+      soundPattern[patternIndex] = soundLevel;
+      patternIndex++;
+    }
+  }
+}
+
+void stopListening() {
+  listeningMode = false;
+  robotState = IDLE_MODE;
+  Serial.println("Finished listening.");
+  
+  // Play processing sound
+  tone(BUZZER_PIN, 600, 200);
+}
+
+void processVoiceCommand() {
+  String command = analyzeVoicePattern();
+  
+  Serial.print("Detected command: ");
+  Serial.println(command);
+  
+  executeCommand(command);
+}
+
+String analyzeVoicePattern() {
+  // Simple pattern analysis based on sound characteristics
+  int totalSounds = 0;
+  int avgLevel = 0;
+  int peakCount = 0;
+  int longSounds = 0;
+  
+  // Analyze the captured pattern
+  for (int i = 0; i < patternIndex; i++) {
+    if (soundPattern[i] > 0) {
+      totalSounds++;
+      avgLevel += soundPattern[i];
+      
+      // Count peaks (high volume sounds)
+      if (soundPattern[i] > soundThreshold + 50) {
+        peakCount++;
+      }
+      
+      // Count sequences of continuous sound
+      if (i < patternIndex - 2) {
+        if (soundPattern[i] > 0 && soundPattern[i+1] > 0 && soundPattern[i+2] > 0) {
+          longSounds++;
+        }
+      }
+    }
+  }
+  
+  if (totalSounds > 0) {
+    avgLevel /= totalSounds;
+  }
+  
+  Serial.print("Analysis - Total sounds: ");
+  Serial.print(totalSounds);
+  Serial.print(", Avg level: ");
+  Serial.print(avgLevel);
+  Serial.print(", Peaks: ");
+  Serial.print(peakCount);
+  Serial.print(", Long sounds: ");
+  Serial.println(longSounds);
+  
+  // Pattern matching - adjust these values based on your testing
+  if (totalSounds < 5) {
+    return "unknown";
+  }
+  
+  // "Hello" - typically 2 syllables, medium length
+  if (longSounds >= 2 && longSounds <= 4 && peakCount >= 1) {
+    return "hello";
+  }
+  
+  // "Wave" - short, single syllable
+  if (totalSounds >= 3 && totalSounds <= 8 && longSounds <= 2) {
+    return "wave";
+  }
+  
+  // "Dance" - short, punchy sound
+  if (peakCount >= 2 && totalSounds <= 10) {
+    return "dance";
+  }
+  
+  // "Happy" - two syllables
+  if (longSounds >= 3 && avgLevel > soundThreshold + 30) {
+    return "happy";
+  }
+  
+  // "Sleep" - longer, softer sound
+  if (longSounds >= 4 && avgLevel < soundThreshold + 40) {
+    return "sleep";
+  }
+  
+  return "unknown";
+}
+
+void executeCommand(String command) {
+  robotState = PERFORMING_ACTION;
+  actionInProgress = true;
+  actionStartTime = millis();
+  
+  if (command == "hello") {
+    performGreeting();
+  } else if (command == "wave") {
+    performWave();
+  } else if (command == "dance") {
+    performDance();
+  } else if (command == "happy") {
+    performHappy();
+  } else if (command == "sleep") {
+    performSleep();
+  } else {
+    performConfused();
+  }
+}
+
+// NEW: Action sequences
+void performGreeting() {
+  Serial.println("Executing: Greeting");
+  drawEyes(HAPPY);
+  display.display();
+  playWallESound("hello");
+  
+  // Wave gesture
+  for (int i = 0; i < 3; i++) {
+    moveServo(RIGHT_ARM_SERVO, 20);
+    delay(300);
+    moveServo(RIGHT_ARM_SERVO, 70);
+    delay(300);
+  }
+}
+
+void performWave() {
+  Serial.println("Executing: Wave");
+  drawEyes(NORMAL);
+  display.display();
+  
+  // Both arms waving
+  for (int i = 0; i < 4; i++) {
+    moveServo(LEFT_ARM_SERVO, 110);
+    moveServo(RIGHT_ARM_SERVO, 20);
+    delay(400);
+    moveServo(LEFT_ARM_SERVO, 70);
+    moveServo(RIGHT_ARM_SERVO, 70);
+    delay(400);
+  }
+}
+
+void performDance() {
+  Serial.println("Executing: Dance");
+  drawEyes(HAPPY);
+  display.display();
+  playWallESound("happy");
+  
+  // Dance sequence
+  for (int i = 0; i < 6; i++) {
+    moveServo(LEFT_ARM_SERVO, 120);
+    moveServo(RIGHT_ARM_SERVO, 20);
+    moveServo(HEAD_SERVO, 20);
+    delay(300);
+    
+    moveServo(LEFT_ARM_SERVO, 60);
+    moveServo(RIGHT_ARM_SERVO, 80);
+    moveServo(HEAD_SERVO, 70);
+    delay(300);
+  }
+}
+
+void performHappy() {
+  Serial.println("Executing: Happy");
+  drawEyes(HAPPY);
+  display.display();
+  playWallESound("happy");
+  
+  // Happy arm movements
+  for (int i = 0; i < 5; i++) {
+    moveServo(LEFT_ARM_SERVO, 110);
+    moveServo(RIGHT_ARM_SERVO, 30);
+    delay(200);
+    moveServo(LEFT_ARM_SERVO, 70);
+    moveServo(RIGHT_ARM_SERVO, 60);
+    delay(200);
+  }
+}
+
+void performSleep() {
+  Serial.println("Executing: Sleep");
+  drawEyes(SLEEPY);
+  display.display();
+  
+  // Slow movement to sleep position
+  moveServo(LEFT_ARM_SERVO, 90);
+  moveServo(RIGHT_ARM_SERVO, 45);
+  moveServo(HEAD_SERVO, 60);
+  
+  // Sleep sound
+  for (int i = 600; i > 300; i -= 50) {
+    tone(BUZZER_PIN, i, 200);
+    delay(250);
+  }
+}
+
+void performConfused() {
+  Serial.println("Executing: Confused (unknown command)");
+  drawEyes(CONFUSED);
+  display.display();
+  playWallESound("question");
+  
+  // Head tilt
+  moveServo(HEAD_SERVO, 20);
+  delay(1000);
