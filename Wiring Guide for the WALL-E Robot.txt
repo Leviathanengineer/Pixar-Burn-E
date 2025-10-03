@@ -1,0 +1,71 @@
+Wiring Guide for the WALL-E Robot
+
+### **Microcontroller**
+
+* Arduino (Uno/Nano/ESP32/etc. depending on what you use)
+
+---
+
+### **OLED Display (SSD1306, I²C version)**
+
+* **VCC → 3.3V or 5V** (check module, most support 5V input)
+* **GND → GND**
+* **SDA → Arduino SDA pin** (A4 on Uno, D21 on ESP32, etc.)
+* **SCL → Arduino SCL pin** (A5 on Uno, D22 on ESP32, etc.)
+* Address: `0x3C` (already set in code)
+
+---
+
+### **PCA9685 Servo Driver (16-channel PWM, I²C)**
+
+* **VCC → 3.3V–5V logic power** (connect to Arduino VCC)
+* **GND → Arduino GND**
+* **SDA → Arduino SDA pin** (same as OLED)
+* **SCL → Arduino SCL pin** (same as OLED)
+* **V+ (servo power) → External 5–6V supply** (depends on your servos)
+* **GND of external supply MUST connect to Arduino GND**
+
+👉 Servos plug into PCA9685 outputs:
+
+* Channel **0 → Left Arm Servo**
+* Channel **1 → Right Arm Servo**
+* Channel **2 → Head Servo**
+
+---
+
+### **Servos**
+
+* Powered through PCA9685 (not directly from Arduino!)
+* Each servo’s signal wire goes to its channel pin (0–2 above).
+
+---
+
+### **Buzzer**
+
+* **Positive → Arduino D8**
+* **Negative → Arduino GND**
+
+---
+
+### **Microphone Module (analog sound sensor)**
+
+* **OUT (analog) → Arduino A0**
+* **VCC → 5V**
+* **GND → GND**
+
+---
+
+### **Button (voice activation trigger)**
+
+* **One side → Arduino D2**
+* **Other side → GND**
+* Arduino has `INPUT_PULLUP` enabled, so no external resistor needed.
+
+---
+
+### ⚠️ Power Notes
+
+* Servos draw too much current for the Arduino’s 5V pin. Use a **separate 5–6V power supply** for servo V+.
+* Tie all grounds together (Arduino GND ↔ PCA9685 GND ↔ Servo power GND).
+* If using more than 2–3 small servos, make sure your external supply can handle **2–3A** minimum.
+
